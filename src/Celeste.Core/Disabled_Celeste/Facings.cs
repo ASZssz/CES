@@ -1,0 +1,9 @@
+#pragma warning disable
+namespace Celeste;
+
+public enum Facings
+{
+	Right = 1,
+	Left = -1
+}
+#pragma warning restore

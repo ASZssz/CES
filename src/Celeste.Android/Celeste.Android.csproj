@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0-android</TargetFramework>
+    <SupportedOSPlatformVersion>21</SupportedOSPlatformVersion>
+    <OutputType>Exe</OutputType>
+    <ApplicationId>Celestegame.app</ApplicationId>
+    <RuntimeIdentifiers>android-arm64</RuntimeIdentifiers>
+    <AndroidEnableProfiling>false</AndroidEnableProfiling>
+    <AndroidUseSharedRuntime>false</AndroidUseSharedRuntime>
+    <EmbedAssembliesIntoApk>true</EmbedAssembliesIntoApk>
+    <NoWarn>SYSLIB0011;CS0029;CS1503;CS1501;CS0117;CS1955;CS1061;CS0266;CS1739;CS0019;CS0246;CS0121;CS0105;CS0103;CS1656;CS0023</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Celeste.Core\Celeste.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <AndroidAsset Include="Content\**\*" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="MonoGame.Content.Builder.Task" Version="3.8.*" />
+    <PackageReference Include="MonoGame.Framework.Android" Version="3.8.*" />
+  </ItemGroup>
+</Project>

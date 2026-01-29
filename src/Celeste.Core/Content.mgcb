@@ -1,0 +1,17 @@
+#----------------------------- Global Properties -----------------------------#
+
+/outputDir:bin/Content
+/intermediateDir:obj/Content
+/platform:DesktopGL
+/config:
+/profile:Reach
+/compress:False
+
+#-------------------------------- References --------------------------------#
+
+/reference:../packages/MonoGame.Framework.DesktopGL.3.8.0/lib/net6.0/MonoGame.Framework.DesktopGL.dll
+
+#--------------------------------- Content ---------------------------------#
+
+#include DesktopGL.mgcb
+
