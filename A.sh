@@ -1,278 +1,448 @@
 #!/usr/bin/env bash
+
+# Configuração de segurança do Bash
+# Aborta se um comando falhar, se uma variável não estiver definida ou se houver erro em pipe
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-ANDROID_API="${ANDROID_API:-34}"
-BUILD_TOOLS="${BUILD_TOOLS:-34.0.0}"
-NDK_VERSION="${NDK_VERSION:-26.3.11579264}"
-CMAKE_VERSION="${CMAKE_VERSION:-3.22.1}"
+# Definição de Variáveis de Versão e Configuração
+ANDROID_API="34"
+BUILD_TOOLS="34.0.0"
+NDK_VERSION="26.3.11579264"
+CMAKE_VERSION="3.22.1"
 
-ANDROID_SDK_DIR="${ANDROID_SDK_DIR:-$HOME/android-sdk}"
-CMDLINE_TOOLS_ZIP="${CMDLINE_TOOLS_ZIP:-commandlinetools-linux-11076708_latest.zip}"
-CMDLINE_TOOLS_URL="${CMDLINE_TOOLS_URL:-https://dl.google.com/android/repository/${CMDLINE_TOOLS_ZIP}}"
+# Caminhos do Sistema
+USER_HOME="$HOME"
+if [ -n "${SUDO_USER:-}" ]; then
+  USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+fi
 
-DOTNET_USER_DIR="${DOTNET_USER_DIR:-$HOME/.dotnet}"
+ANDROID_SDK_DIR="$USER_HOME/android-sdk"
+DOTNET_USER_DIR="$USER_HOME/.dotnet"
+CMDLINE_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
 
-LOG_DIR="${LOG_DIR:-$HOME}"
-LOG_FILE="${LOG_FILE:-$LOG_DIR/bootstrap-app-android-$(date +%Y%m%d-%H%M%S).txt}"
+# Configuração de Logs
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+LOG_FILE="$USER_HOME/bootstrap-install-$TIMESTAMP.log"
 
+# Evita interatividade do apt
 export DEBIAN_FRONTEND=noninteractive
 
+# Redireciona stdout e stderr para o log e para o console
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-on_err() {
+# ------------------------------------------------------------------------------
+# Funções de Utilitários e Logging
+# ------------------------------------------------------------------------------
+
+# Função para registrar mensagens informativas em verde
+log_info() {
+  local msg="$1"
+  local time
+  time=$(date +%H:%M:%S)
+  printf "\033[0;32m[%s] [INFO] %s\033[0m\n" "$time" "$msg"
+}
+
+# Função para registrar avisos em amarelo
+log_warn() {
+  local msg="$1"
+  local time
+  time=$(date +%H:%M:%S)
+  printf "\033[0;33m[%s] [WARN] %s\033[0m\n" "$time" "$msg" >&2
+}
+
+# Função para registrar erros fatais em vermelho e sair
+log_fatal() {
+  local msg="$1"
+  local time
+  time=$(date +%H:%M:%S)
+  printf "\033[0;31m[%s] [FATAL] %s\033[0m\n" "$time" "$msg" >&2
+  exit 1
+}
+
+# Tratamento de erro (trap)
+on_error() {
   local exit_code=$?
-  echo "[FATAL] Falha na linha ${BASH_LINENO[0]}: comando '${BASH_COMMAND}' (exit=${exit_code})"
-  echo "[FATAL] Log: $LOG_FILE"
-  exit "$exit_code"
+  local line_number=${BASH_LINENO[0]}
+  local command="${BASH_COMMAND}"
+  log_fatal "Falha na linha $line_number executando: '$command'. Código de saída: $exit_code. Verifique o log em: $LOG_FILE"
 }
-trap on_err ERR
+trap on_error ERR
 
-log() { printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*"; }
-
-need_sudo() {
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "[FATAL] sudo não encontrado."
-    exit 1
+# Verificação de privilégios
+check_sudo() {
+  if [ "$(id -u)" -ne 0 ] && ! command -v sudo >/dev/null 2>&1; then
+    log_fatal "Este script requer privilégios de superusuário (root) ou sudo instalado."
   fi
 }
 
-as_root() { need_sudo; sudo "$@"; }
-
-retry() {
-  local -r tries="$1"; shift
-  local -r delay="$1"; shift
-  local n=0
-  until "$@"; do
-    n=$((n+1))
-    if [ "$n" -ge "$tries" ]; then
-      return 1
-    fi
-    log "retry ${n}/${tries}: $* (aguardando ${delay}s)"
-    sleep "$delay"
-  done
-}
-
-append_once() {
-  local file="$1"
-  local line="$2"
-  touch "$file"
-  grep -Fqs "$line" "$file" || printf "\n%s\n" "$line" >> "$file"
-}
-
-dpkg_has() { dpkg -s "$1" >/dev/null 2>&1; }
-
-apt_update_once() {
-  if [ "${_APT_UPDATED:-0}" = "0" ]; then
-    log "apt: update"
-    as_root apt-get update -y
-    _APT_UPDATED=1
-  fi
-}
-
-apt_install_missing() {
-  apt_update_once
-  local pkgs=()
-  local p
-  for p in "$@"; do
-    if ! dpkg_has "$p"; then
-      pkgs+=("$p")
-    fi
-  done
-  if [ "${#pkgs[@]}" -gt 0 ]; then
-    log "apt: install (${#pkgs[@]}): ${pkgs[*]}"
-    as_root apt-get install -y --no-install-recommends "${pkgs[@]}"
+# Wrapper para execução como root
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
   else
-    log "apt: ok (nada a instalar)"
+    sudo "$@"
   fi
 }
 
-ensure_nodesource_20() {
+# Wrapper para execução como o usuário real (não root)
+run_as_user() {
+  if [ -n "${SUDO_USER:-}" ]; then
+    sudo -u "$SUDO_USER" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Adicionar variáveis de ambiente de forma persistente
+append_to_profile() {
+  local var_name="$1"
+  local var_value="$2"
+  local files=("$USER_HOME/.bashrc" "$USER_HOME/.profile" "$USER_HOME/.zshrc")
+  
+  export "$var_name"="$var_value"
+
+  for file in "${files[@]}"; do
+    if [ -f "$file" ] || [ "$file" = "$USER_HOME/.bashrc" ]; then
+      touch "$file"
+      if ! grep -q "export $var_name=" "$file"; then
+        echo "export $var_name=\"$var_value\"" >> "$file"
+        log_info "Variável $var_name adicionada ao $file"
+      fi
+    fi
+  done
+}
+
+# Adicionar ao PATH de forma persistente
+append_to_path() {
+  local new_path="$1"
+  local files=("$USER_HOME/.bashrc" "$USER_HOME/.profile" "$USER_HOME/.zshrc")
+  
+  export PATH="$new_path:$PATH"
+
+  for file in "${files[@]}"; do
+    if [ -f "$file" ] || [ "$file" = "$USER_HOME/.bashrc" ]; then
+      touch "$file"
+      if ! grep -q "export PATH=\"$new_path:\$PATH\"" "$file"; then
+        echo "export PATH=\"$new_path:\$PATH\"" >> "$file"
+        log_info "Caminho $new_path adicionado ao PATH em $file"
+      fi
+    fi
+  done
+}
+
+# Wrapper seguro para apt-get install
+install_apt_package() {
+  local package="$1"
+  if dpkg -s "$package" >/dev/null 2>&1; then
+    log_info "Pacote '$package' já está instalado."
+  else
+    log_info "Instalando pacote: $package"
+    run_as_root apt-get install -y -qq \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      --no-install-recommends "$package"
+  fi
+}
+
+# Wrapper para download com retries
+download_file() {
+  local url="$1"
+  local output="$2"
+  local retries=3
+  local count=0
+
+  until [ "$count" -ge "$retries" ]; do
+    log_info "Baixando $url (Tentativa $((count+1))/$retries)..."
+    if curl -fsSL "$url" -o "$output"; then
+      return 0
+    fi
+    count=$((count+1))
+    log_warn "Falha no download. Tentando novamente em 2 segundos..."
+    sleep 2
+  done
+  log_fatal "Falha ao baixar $url após $retries tentativas."
+}
+
+# ------------------------------------------------------------------------------
+# Fase 1: Preparação do Sistema e Ferramentas Básicas
+# ------------------------------------------------------------------------------
+
+phase_system_prep() {
+  log_info "Iniciando atualização do sistema..."
+  run_as_root apt-get update -y -qq
+  
+  log_info "Instalando dependências essenciais..."
+  local basic_packages=(
+    "bash"
+    "coreutils"
+    "git"
+    "curl"
+    "wget"
+    "unzip"
+    "zip"
+    "tar"
+    "xz-utils"
+    "software-properties-common"
+    "build-essential"
+    "gcc"
+    "g++"
+    "make"
+    "cmake"
+    "ninja-build"
+    "pkg-config"
+    "autoconf"
+    "libtool"
+    "clang"
+    "llvm"
+    "lld"
+    "gdb"
+    "python3"
+    "python3-pip"
+    "libsdl2-dev"
+    "libopenal-dev"
+    "libfreetype6-dev"
+    "libfontconfig1-dev"
+    "libssl-dev"
+    "zlib1g-dev"
+  )
+
+  for pkg in "${basic_packages[@]}"; do
+    install_apt_package "$pkg"
+  done
+}
+
+# ------------------------------------------------------------------------------
+# Fase 2: Node.js 20 (NodeSource)
+# ------------------------------------------------------------------------------
+
+phase_nodejs() {
+  log_info "Verificando instalação do Node.js..."
+  
+  local need_install=true
   if command -v node >/dev/null 2>&1; then
-    local major
-    major="$(node -v | sed -E 's/^v([0-9]+).*/\1/')" || major=""
-    if [ "$major" = "20" ]; then
-      log "nodejs: já é v20"
-      return 0
+    local node_version
+    node_version=$(node -v)
+    if [[ "$node_version" == v20* ]]; then
+      log_info "Node.js $node_version já está instalado."
+      need_install=false
     fi
   fi
 
-  log "nodejs: configurando NodeSource 20.x"
-  apt_install_missing ca-certificates curl gnupg
-  as_root mkdir -p /etc/apt/keyrings
-  retry 3 2 bash -lc 'curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg'
-  echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | as_root tee /etc/apt/sources.list.d/nodesource.list >/dev/null
-  _APT_UPDATED=0
-  apt_install_missing nodejs
-  node -v || true
-  npm -v || true
+  if [ "$need_install" = true ]; then
+    log_info "Configurando repositório NodeSource v20..."
+    install_apt_package "ca-certificates"
+    install_apt_package "gnupg"
+    
+    run_as_root mkdir -p /etc/apt/keyrings
+    run_as_root rm -f /etc/apt/keyrings/nodesource.gpg
+    
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+      run_as_root gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+    
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" | \
+      run_as_root tee /etc/apt/sources.list.d/nodesource.list >/dev/null
+    
+    run_as_root apt-get update -y -qq
+    install_apt_package "nodejs"
+  fi
 }
 
-detect_java_home() {
+# ------------------------------------------------------------------------------
+# Fase 3: Java 17 (OpenJDK)
+# ------------------------------------------------------------------------------
+
+phase_java() {
+  log_info "Configurando Java 17..."
+  install_apt_package "openjdk-17-jdk"
+  
   local javac_path
-  javac_path="$(command -v javac 2>/dev/null || true)"
-  if [ -z "$javac_path" ]; then
-    return 0
+  javac_path=$(readlink -f "$(command -v javac)" 2>/dev/null || true)
+  
+  if [ -n "$javac_path" ]; then
+    local java_home_dir
+    java_home_dir=$(echo "$javac_path" | sed 's#/bin/javac##')
+    log_info "JAVA_HOME detectado: $java_home_dir"
+    
+    append_to_profile "JAVA_HOME" "$java_home_dir"
+    append_to_path "$java_home_dir/bin"
+  else
+    log_warn "Não foi possível detectar o caminho do javac automaticamente."
   fi
-  readlink -f "$javac_path" | sed 's#/bin/javac##'
 }
 
-ensure_java17() {
-  log "Java: instalando JDK 17"
-  apt_install_missing openjdk-17-jdk
-  local jh
-  jh="$(detect_java_home || true)"
-  if [ -n "$jh" ]; then
-    export JAVA_HOME="$jh"
-    append_once "$HOME/.bashrc" "export JAVA_HOME=\"$JAVA_HOME\""
-    append_once "$HOME/.profile" "export JAVA_HOME=\"$JAVA_HOME\""
-    append_once "$HOME/.bashrc" "export PATH=\"\$JAVA_HOME/bin:\$PATH\""
-    append_once "$HOME/.profile" "export PATH=\"\$JAVA_HOME/bin:\$PATH\""
+# ------------------------------------------------------------------------------
+# Fase 4: .NET 8 SDK
+# ------------------------------------------------------------------------------
+
+phase_dotnet() {
+  log_info "Verificando instalação do .NET 8..."
+  
+  if command -v dotnet >/dev/null 2>&1 && [[ "$(dotnet --version)" == 8.* ]]; then
+    log_info ".NET 8 já está instalado."
+  else
+    log_info "Instalando .NET 8 via script de instalação oficial..."
+    
+    local install_script="/tmp/dotnet-install.sh"
+    download_file "https://dot.net/v1/dotnet-install.sh" "$install_script"
+    chmod +x "$install_script"
+    
+    run_as_user mkdir -p "$DOTNET_USER_DIR"
+    run_as_user bash "$install_script" --channel 8.0 --install-dir "$DOTNET_USER_DIR"
+    
+    append_to_profile "DOTNET_ROOT" "$DOTNET_USER_DIR"
+    append_to_path "$DOTNET_USER_DIR"
+    append_to_path "$DOTNET_USER_DIR/tools"
+    
+    rm -f "$install_script"
   fi
-  java -version 2>&1 | head -n 2 || true
-  javac -version 2>&1 || true
+
+  log_info "Verificando Workload Android para .NET..."
+  if ! run_as_user "$DOTNET_USER_DIR/dotnet" workload list | grep -qi "android"; then
+    log_info "Instalando Workload Android..."
+    run_as_user "$DOTNET_USER_DIR/dotnet" workload install android --skip-manifest-update
+  else
+    log_info "Workload Android já instalado."
+  fi
 }
 
-ensure_dotnet8() {
-  if command -v dotnet >/dev/null 2>&1; then
-    local v
-    v="$(dotnet --version 2>/dev/null || true)"
-    if [[ "$v" == 8.* ]]; then
-      log ".NET: já disponível (dotnet $v)"
-      return 0
+# ------------------------------------------------------------------------------
+# Fase 5: Android SDK, NDK e CMake
+# ------------------------------------------------------------------------------
+
+phase_android_sdk() {
+  log_info "Configurando Android SDK em: $ANDROID_SDK_DIR"
+  
+  run_as_user mkdir -p "$ANDROID_SDK_DIR/cmdline-tools"
+  run_as_user mkdir -p "$ANDROID_SDK_DIR/platform-tools"
+  run_as_user mkdir -p "$USER_HOME/.android"
+  
+  # Cria arquivo de repositórios para evitar avisos
+  run_as_user touch "$USER_HOME/.android/repositories.cfg"
+
+  # Instalação das Command Line Tools
+  if [ ! -d "$ANDROID_SDK_DIR/cmdline-tools/latest" ]; then
+    log_info "Baixando Android Command Line Tools..."
+    local zip_path="/tmp/cmdline-tools.zip"
+    download_file "$CMDLINE_TOOLS_URL" "$zip_path"
+    
+    local temp_extract="/tmp/cmdline-extract"
+    mkdir -p "$temp_extract"
+    unzip -q "$zip_path" -d "$temp_extract"
+    
+    run_as_user mkdir -p "$ANDROID_SDK_DIR/cmdline-tools/latest"
+    
+    # Move o conteúdo corretamente dependendo da estrutura do zip
+    if [ -d "$temp_extract/cmdline-tools" ]; then
+      run_as_user cp -r "$temp_extract/cmdline-tools/"* "$ANDROID_SDK_DIR/cmdline-tools/latest/"
+    elif [ -d "$temp_extract/tools" ]; then
+      run_as_user cp -r "$temp_extract/tools/"* "$ANDROID_SDK_DIR/cmdline-tools/latest/"
+    else
+      # Fallback genérico
+      run_as_user cp -r "$temp_extract/"* "$ANDROID_SDK_DIR/cmdline-tools/latest/"
     fi
+    
+    rm -rf "$temp_extract"
+    rm -f "$zip_path"
   fi
 
-  log ".NET: tentando instalar via repositório Microsoft (apt)"
-  apt_install_missing ca-certificates wget gpg apt-transport-https
+  # Variáveis de Ambiente Android
+  append_to_profile "ANDROID_HOME" "$ANDROID_SDK_DIR"
+  append_to_profile "ANDROID_SDK_ROOT" "$ANDROID_SDK_DIR"
+  append_to_path "$ANDROID_SDK_DIR/cmdline-tools/latest/bin"
+  append_to_path "$ANDROID_SDK_DIR/platform-tools"
 
-  local ubuntu_codename
-  ubuntu_codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
-  if [ -z "$ubuntu_codename" ]; then
-    ubuntu_codename="jammy"
-  fi
+  # Aceitação de Licenças via Hash (Método Otimizado)
+  log_info "Escrevendo licenças do Android SDK..."
+  run_as_user mkdir -p "$ANDROID_SDK_DIR/licenses"
+  
+  # Licença SDK principal
+  echo "24333f8a63b6825ea9c5514f83c2829b004d1fee" | run_as_user tee "$ANDROID_SDK_DIR/licenses/android-sdk-license" >/dev/null
+  echo "84831b9409646a918e30573bab4c9c91346d8abd" | run_as_user tee -a "$ANDROID_SDK_DIR/licenses/android-sdk-license" >/dev/null
+  
+  # Outras licenças
+  echo "601085b94cd77f0b54ff86406957099ebe79c4d6" | run_as_user tee "$ANDROID_SDK_DIR/licenses/android-googletv-license" >/dev/null
+  echo "33b6a2b64607f11b759f320ef9dff4ae5c47d97a" | run_as_user tee "$ANDROID_SDK_DIR/licenses/google-gdk-license" >/dev/null
+  echo "e9acab5b5fbb560a72cfaecce6eb5b36b1e850d9" | run_as_user tee "$ANDROID_SDK_DIR/licenses/mips-android-sysimage-license" >/dev/null
 
-  as_root mkdir -p /etc/apt/keyrings
-  if [ ! -f /etc/apt/keyrings/microsoft.gpg ]; then
-    retry 3 2 bash -lc 'wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg'
-  fi
-  if [ ! -f /etc/apt/sources.list.d/microsoft-prod.list ]; then
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/${ubuntu_codename}/prod ${ubuntu_codename} main" | as_root tee /etc/apt/sources.list.d/microsoft-prod.list >/dev/null
-    _APT_UPDATED=0
-  fi
-
-  apt_update_once
-  if ! as_root apt-get install -y --no-install-recommends dotnet-sdk-8.0; then
-    log ".NET: fallback dotnet-install (userland)"
-    retry 3 2 curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-    mkdir -p "$DOTNET_USER_DIR"
-    bash /tmp/dotnet-install.sh --channel 8.0 --install-dir "$DOTNET_USER_DIR"
-    export DOTNET_ROOT="$DOTNET_USER_DIR"
-    export PATH="$DOTNET_USER_DIR:$PATH"
-    append_once "$HOME/.bashrc" "export DOTNET_ROOT=\"$DOTNET_USER_DIR\""
-    append_once "$HOME/.profile" "export DOTNET_ROOT=\"$DOTNET_USER_DIR\""
-    append_once "$HOME/.bashrc" "export PATH=\"\$DOTNET_ROOT:\$PATH\""
-    append_once "$HOME/.profile" "export PATH=\"\$DOTNET_ROOT:\$PATH\""
-  fi
-
-  dotnet --info | head -n 25 || true
-}
-
-ensure_dotnet_android_workload() {
-  log ".NET: garantindo workload android"
-  if dotnet workload list 2>/dev/null | grep -qiE 'android'; then
-    log ".NET: workload android já instalado"
-  else
-    dotnet workload install android
-  fi
-  dotnet workload list | sed -n '1,160p' || true
-}
-
-ensure_android_sdk() {
-  log "Android: preparando SDK em $ANDROID_SDK_DIR"
-  mkdir -p "$ANDROID_SDK_DIR/cmdline-tools" "$ANDROID_SDK_DIR/platform-tools" "$HOME/.android"
-
-  local sdkmanager="$ANDROID_SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
-  if [ ! -x "$sdkmanager" ]; then
-    log "Android: baixando cmdline-tools"
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    retry 3 2 curl -fsSL -o "$tmpdir/cmdline.zip" "$CMDLINE_TOOLS_URL"
-    unzip -q "$tmpdir/cmdline.zip" -d "$tmpdir"
-    rm -rf "$ANDROID_SDK_DIR/cmdline-tools/latest"
-    mv "$tmpdir/cmdline-tools" "$ANDROID_SDK_DIR/cmdline-tools/latest"
-    rm -rf "$tmpdir"
-  else
-    log "Android: cmdline-tools já presente"
-  fi
-
-  export ANDROID_SDK_ROOT="$ANDROID_SDK_DIR"
-  export ANDROID_HOME="$ANDROID_SDK_DIR"
-  export PATH="$ANDROID_SDK_DIR/cmdline-tools/latest/bin:$ANDROID_SDK_DIR/platform-tools:$PATH"
-
-  append_once "$HOME/.bashrc" "export ANDROID_SDK_ROOT=\"$ANDROID_SDK_DIR\""
-  append_once "$HOME/.profile" "export ANDROID_SDK_ROOT=\"$ANDROID_SDK_DIR\""
-  append_once "$HOME/.bashrc" "export ANDROID_HOME=\"$ANDROID_SDK_DIR\""
-  append_once "$HOME/.profile" "export ANDROID_HOME=\"$ANDROID_SDK_DIR\""
-  append_once "$HOME/.bashrc" "export PATH=\"\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$PATH\""
-  append_once "$HOME/.profile" "export PATH=\"\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$PATH\""
-
-  log "Android: aceitando licenças"
-  yes | "$sdkmanager" --sdk_root="$ANDROID_SDK_DIR" --licenses >/dev/null || true
-
-  log "Android: instalando platform-tools/platforms/build-tools/ndk/cmake"
-  "$sdkmanager" --sdk_root="$ANDROID_SDK_DIR" \
+  # Instalação dos pacotes via sdkmanager
+  local sdkmanager_bin="$ANDROID_SDK_DIR/cmdline-tools/latest/bin/sdkmanager"
+  
+  log_info "Instalando Plataforma, Build-Tools, NDK e CMake..."
+  yes | run_as_user "$sdkmanager_bin" --install \
     "platform-tools" \
     "platforms;android-${ANDROID_API}" \
     "build-tools;${BUILD_TOOLS}" \
-    "cmdline-tools;latest" \
     "ndk;${NDK_VERSION}" \
-    "cmake;${CMAKE_VERSION}"
-
-  adb version | head -n 1 || true
-  "$sdkmanager" --sdk_root="$ANDROID_SDK_DIR" --list_installed | sed -n '1,180p' || true
+    "cmake;${CMAKE_VERSION}" >/dev/null
 }
 
-ensure_monogame() {
-  log "MonoGame: templates + MGCB editor"
-  dotnet new install MonoGame.Templates.CSharp >/dev/null 2>&1 || true
-  dotnet tool install --global dotnet-mgcb-editor >/dev/null 2>&1 || true
-  append_once "$HOME/.bashrc" "export PATH=\"\$HOME/.dotnet/tools:\$PATH\""
-  append_once "$HOME/.profile" "export PATH=\"\$HOME/.dotnet/tools:\$PATH\""
-  export PATH="$HOME/.dotnet/tools:$PATH"
+# ------------------------------------------------------------------------------
+# Fase 6: Mono e MonoGame
+# ------------------------------------------------------------------------------
+
+phase_monogame() {
+  log_info "Instalando Mono Runtime e Compilador..."
+  install_apt_package "mono-complete"
+  
+  log_info "Instalando templates do MonoGame e MGCB Editor..."
+  run_as_user "$DOTNET_USER_DIR/dotnet" new install MonoGame.Templates.CSharp >/dev/null 2>&1 || true
+  run_as_user "$DOTNET_USER_DIR/dotnet" tool install --global dotnet-mgcb-editor >/dev/null 2>&1 || true
 }
 
-ensure_mono() {
-  log "Mono: instalando (legado)"
-  apt_install_missing mono-complete || true
-  if ! command -v mono >/dev/null 2>&1; then
-    apt_install_missing mono-runtime mono-devel || true
+# ------------------------------------------------------------------------------
+# Fase 7: Docker
+# ------------------------------------------------------------------------------
+
+phase_docker() {
+  log_info "Verificando instalação do Docker..."
+  
+  if ! command -v docker >/dev/null 2>&1; then
+    log_info "Docker não encontrado. Instalando via script oficial..."
+    local docker_script="/tmp/get-docker.sh"
+    download_file "https://get.docker.com" "$docker_script"
+    run_as_root sh "$docker_script"
+    rm -f "$docker_script"
+    
+    # Adicionar usuário ao grupo docker
+    if [ -n "${SUDO_USER:-}" ]; then
+      log_info "Adicionando usuário $SUDO_USER ao grupo docker..."
+      run_as_root usermod -aG docker "$SUDO_USER" || true
+    fi
+  else
+    log_info "Docker já instalado."
   fi
-  mono --version 2>/dev/null | head -n 2 || true
 }
 
-ensure_docker() {
-  log "Docker: instalando client + compose plugin"
-  apt_install_missing docker.io docker-compose-plugin
-  if command -v docker >/dev/null 2>&1; then
-    as_root usermod -aG docker "$USER" 2>/dev/null || true
-    docker --version || true
-    docker compose version 2>/dev/null || true
-  fi
-}
+# ------------------------------------------------------------------------------
+# Fase 8: VS Code e Extensões
+# ------------------------------------------------------------------------------
 
-vscode_ext_installed() {
-  local ext="$1"
-  code --list-extensions 2>/dev/null | awk '{print tolower($0)}' | grep -qx "$(echo "$ext" | awk '{print tolower($0)}')"
-}
-
-install_vscode_extensions_41() {
+phase_vscode() {
+  log_info "Verificando VS Code..."
+  
   if ! command -v code >/dev/null 2>&1; then
-    log "VS Code: 'code' não disponível. Pulando instalação de extensões."
-    return 0
+    log_info "Instalando Visual Studio Code..."
+    install_apt_package "wget"
+    install_apt_package "gpg"
+    install_apt_package "apt-transport-https"
+    
+    local key_ring="/etc/apt/keyrings/packages.microsoft.gpg"
+    wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | run_as_root tee "$key_ring" >/dev/null
+    
+    echo "deb [arch=amd64,arm64,armhf signed-by=$key_ring] https://packages.microsoft.com/repos/code stable main" | \
+      run_as_root tee /etc/apt/sources.list.d/vscode.list >/dev/null
+    
+    run_as_root apt-get update -y -qq
+    install_apt_package "code"
+  else
+    log_info "VS Code já instalado."
   fi
 
-  local exts=(
+  log_info "Iniciando instalação de 42 extensões do VS Code..."
+  
+  # Array contendo todas as extensões solicitadas
+  local extensions=(
     "13xforever.language-x86-64-assembly"
     "adelphes.android-dev-ext"
     "bbenoist.doxygen"
@@ -317,94 +487,119 @@ install_vscode_extensions_41() {
     "zlorn.vstuc"
   )
 
-  log "VS Code: instalando 41 extensões (pula as já instaladas)"
-  local ext
-  for ext in "${exts[@]}"; do
-    if vscode_ext_installed "$ext"; then
-      log "VS Code: ok (já instalada) $ext"
-      continue
+  local count=0
+  local total=${#extensions[@]}
+  local installed_list
+  
+  # Obtém lista de extensões já instaladas para otimizar
+  if [ -n "${SUDO_USER:-}" ]; then
+    installed_list=$(run_as_user code --list-extensions)
+  else
+    installed_list=$(code --list-extensions)
+  fi
+  
+  # Converte para minúsculas para comparação insensível a caixa
+  installed_list=$(echo "$installed_list" | tr '[:upper:]' '[:lower:]')
+
+  for ext in "${extensions[@]}"; do
+    count=$((count + 1))
+    local ext_lower
+    ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    
+    if echo "$installed_list" | grep -q "$ext_lower"; then
+      log_info "[$count/$total] Extensão já instalada: $ext"
+    else
+      log_info "[$count/$total] Instalando extensão: $ext..."
+      # Instala como o usuário correto
+      if [ -n "${SUDO_USER:-}" ]; then
+        if sudo -u "$SUDO_USER" code --install-extension "$ext" --force >/dev/null 2>&1; then
+           log_info "   -> Sucesso: $ext"
+        else
+           log_warn "   -> Falha ao instalar: $ext (Verifique compatibilidade ou ID)"
+        fi
+      else
+        if code --install-extension "$ext" --force >/dev/null 2>&1; then
+           log_info "   -> Sucesso: $ext"
+        else
+           log_warn "   -> Falha ao instalar: $ext"
+        fi
+      fi
     fi
-    log "VS Code: install $ext"
-    code --install-extension "$ext" >/dev/null 2>&1 || true
   done
-
-  log "VS Code: contagem instalada (após tentativa)"
-  code --list-extensions | wc -l || true
 }
 
-install_base_toolchain_for_app() {
-  log "Base/toolchain: instalando o necessário para compilar app (C/C++ + libs + utilitários)"
-  apt_install_missing \
-    bash coreutils \
-    git openssh-client \
-    curl wget jq \
-    unzip zip tar xz-utils \
-    file less nano \
-    ca-certificates gnupg \
-    build-essential gcc g++ make \
-    cmake ninja-build meson pkg-config autoconf automake libtool \
-    clang llvm lld gdb \
-    python3 python3-pip \
-    openssl sqlite3 libssl-dev zlib1g-dev libsqlite3-dev \
-    libsdl2-dev libopenal-dev libfreetype6-dev libfontconfig1-dev libpng-dev \
-    gradle
+# ------------------------------------------------------------------------------
+# Fase 9: Limpeza e Relatório Final
+# ------------------------------------------------------------------------------
+
+phase_cleanup() {
+  log_info "Executando limpeza do apt..."
+  run_as_root apt-get clean
+  run_as_root rm -rf /var/lib/apt/lists/*
+  run_as_root rm -rf /tmp/*dotnet* /tmp/*android*
 }
 
-sanity() {
-  log "Sanity:"
-  echo "dotnet: $(dotnet --version 2>/dev/null || echo missing)"
-  echo "workloads: $(dotnet workload list 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g' | head -c 200 || true)"
-  echo "java: $(java -version 2>&1 | head -n 1 || echo missing)"
-  echo "javac: $(javac -version 2>&1 || echo missing)"
-  echo "sdkmanager: $(command -v sdkmanager || echo missing)"
-  echo "adb: $(adb version 2>/dev/null | head -n 1 || echo missing)"
-  echo "mono: $(mono --version 2>/dev/null | head -n 1 || echo missing)"
-  echo "docker: $(docker --version 2>/dev/null || echo missing)"
-  echo "node: $(node -v 2>/dev/null || echo missing)"
-  echo "npm: $(npm -v 2>/dev/null || echo missing)"
-  echo "ANDROID_SDK_ROOT: ${ANDROID_SDK_ROOT:-unset}"
-  echo "JAVA_HOME: ${JAVA_HOME:-unset}"
-  echo "LOG: $LOG_FILE"
+phase_report() {
+  log_info "Gerando relatório de versões..."
+  
+  echo ""
+  echo "RELATÓRIO DE AMBIENTE INSTALADO"
+  echo "Data: $(date)"
+  echo ""
+  
+  echo "--- Sistema ---"
+  echo "OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"')"
+  echo "Kernel: $(uname -r)"
+  
+  echo ""
+  echo "--- Linguagens & Runtimes ---"
+  echo "Java: $(java -version 2>&1 | head -n 1)"
+  echo "Node.js: $(run_as_user node -v 2>/dev/null || echo 'Erro')"
+  echo "NPM: $(run_as_user npm -v 2>/dev/null || echo 'Erro')"
+  echo ".NET SDK: $(run_as_user "$DOTNET_USER_DIR/dotnet" --version 2>/dev/null || echo 'Erro')"
+  echo "Mono: $(mono --version 2>/dev/null | head -n 1 || echo 'Não encontrado')"
+  
+  echo ""
+  echo "--- Android ---"
+  echo "SDK Root: $ANDROID_SDK_DIR"
+  echo "ADB: $(run_as_user "$ANDROID_SDK_DIR/platform-tools/adb" version 2>/dev/null | head -n 1 || echo 'Erro')"
+  echo "NDK Version: $NDK_VERSION"
+  
+  echo ""
+  echo "--- Ferramentas ---"
+  echo "Docker: $(docker --version 2>/dev/null || echo 'Não encontrado')"
+  echo "Docker Compose: $(docker compose version 2>/dev/null || echo 'Não encontrado')"
+  echo "VS Code: $(code --version 2>/dev/null | head -n 1 || echo 'Não encontrado')"
+  
+  echo ""
+  echo "Instalação concluída com sucesso!"
+  echo "Por favor, reinicie seu terminal ou execute 'source ~/.bashrc' para carregar as variáveis."
+  echo "Se você instalou o Docker, pode ser necessário fazer logout/login para atualizar as permissões de grupo."
+  echo ""
 }
+
+# ------------------------------------------------------------------------------
+# Execução Principal
+# ------------------------------------------------------------------------------
 
 main() {
-  log "Bootstrap iniciado (Ubuntu/Codespace). Log: $LOG_FILE"
-  need_sudo
-
-  log "1) Base + toolchain"
-  install_base_toolchain_for_app
-
-  log "2) Node.js 20 + npm"
-  ensure_nodesource_20
-
-  log "3) Java 17 + JAVA_HOME"
-  ensure_java17
-
-  log "4) .NET SDK 8"
-  ensure_dotnet8
-
-  log "5) .NET Android workload"
-  ensure_dotnet_android_workload
-
-  log "6) Android SDK (SDK/NDK/CMake conforme script base)"
-  ensure_android_sdk
-
-  log "7) Mono (legado)"
-  ensure_mono
-
-  log "8) MonoGame tools"
-  ensure_monogame
-
-  log "9) Docker"
-  ensure_docker
-
-  log "10) VS Code: 41 extensões"
-  install_vscode_extensions_41
-
-  sanity
-
-  log "Concluído. Reabra o terminal (ou rode: source ~/.bashrc). Se instalou Docker, reabra para o grupo docker aplicar."
+  log_info "Iniciando script de configuração do ambiente de desenvolvimento..."
+  check_sudo
+  
+  # Sequência de execução das fases
+  phase_system_prep
+  phase_nodejs
+  phase_java
+  phase_dotnet
+  phase_android_sdk
+  phase_monogame
+  phase_docker
+  phase_vscode
+  phase_cleanup
+  phase_report
+  
+  log_info "Log completo salvo em: $LOG_FILE"
 }
 
+# Inicia o script
 main "$@"
-```0
